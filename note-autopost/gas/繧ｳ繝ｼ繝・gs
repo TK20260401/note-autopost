@@ -1,0 +1,142 @@
+/**
+ * Googleスプレッドシートに貼り付けて使う Apps Script(GAS)
+ * 役割:
+ *   (A) 「キーワード」から X投稿の下書きを Gemini(無料枠) で生成し text列へ
+ *   (B) 朝(通勤)・昼(休憩)に、下書き確認をうながすリマインドメールを自分に送る
+ *       (メールにはこのスプレッドシートの直リンク付き)
+ *   投稿そのものはしない。投稿はGitHub側のbot(src/promo.js)が『投稿OK』にチェックされた行だけ実行。
+ *
+ * 事前準備:
+ *  1) Google AI Studio (https://aistudio.google.com/apikey) で無料のGemini APIキーを取得
+ *  2) スプレッドシート → 拡張機能 → Apps Script を開き、このコードを貼り付けて保存
+ *  3) 左の歯車(プロジェクトの設定):
+ *       ・タイムゾーンを (GMT+09:00) 東京 に設定
+ *       ・スクリプト プロパティに  名前: GEMINI_API_KEY  値: 取得したキー  を追加
+ *  4) 下の TO_EMAIL を自分のメールに書き換える
+ *  5) 関数選択で setupReminders を選び「実行」→ 初回だけ権限を承認
+ *       (これで 朝7:15 / 昼12:00 の自動メールがセットされます)
+ *  6) シートを再読み込みすると上部に「AI下書き」メニューが出ます
+ */
+
+var GEMINI_MODEL = 'gemini-3.6-flash';        // ← 無料枠のある現行モデル。世代交代したら新しいFlashに差し替え
+var TO_EMAIL = 'you@example.com';             // ← リマインドメールの宛先。自分のアドレスに変更
+
+// ← あなたの発信の「声」。ここを自分のプロフィール・文体に書き換えると、生成される文が自分らしくなる。
+var STYLE =
+  'あなたは、私本人になりきってXの投稿を書くゴーストライターです。' +
+  '(ここに自分の経歴・肩書き・扱うテーマを書く。例:元教員から転じたAIエンジニア。ローカルLLMや会計AIを個人開発。)' +
+  '目標:実在する一人の人間が、自信を持って書いた「最終稿」として通用する投稿にすること。下書き感を残さない。' +
+  'やらないこと:AIが書いたと分かる定型句、優等生的な言い回し、過剰な前置きや「いかがでしたか」的なまとめ、空疎な意識高い系表現、誇張・宣伝くささ・煽り。' +
+  'やること:一人称で書く。体験に根ざした具体を必ず1つ入れる。定性的な印象論より定量的に――可能なら数字を1つ入れ、実現可能性と再現性が伝わるように書く。断定できる箇所は言い切る。うまくいった自慢より、つまずき・失敗とそこで得た学びを描く。' +
+  '文体:短く歯切れよく。読点で息継ぎできるリズム。専門用語は必要最小限で、非エンジニアにも伝わる言葉に。' +
+  '読み手:同じように関心のある人。押し付けず、そっと差し出すように語る。';
+
+/* ===================== メニュー ===================== */
+function onOpen() {
+  SpreadsheetApp.getUi()
+    .createMenu('AI下書き')
+    .addItem('キーワードから下書き生成', 'generateDrafts')
+    .addSeparator()
+    .addItem('リマインドメールを今すぐテスト送信', 'sendReminderTest')
+    .addItem('朝昼リマインドをセット(初回のみ)', 'setupReminders')
+    .addToUi();
+}
+
+/* ===================== 下書き生成 ===================== */
+function generateDrafts() {
+  var ui = SpreadsheetApp.getUi();
+  var n = generateDraftsCore();
+  if (n < 0) { ui.alert('設定エラー: GEMINI_API_KEY か、keywords/text 列を確認してください。'); return; }
+  ui.alert(n + ' 件の下書きを生成しました。内容を確認し、良ければ『投稿OK』にチェックを入れてください。');
+}
+
+// UIなし版(トリガーからも呼べる)。生成した件数を返す。設定不足は -1。
+function generateDraftsCore() {
+  var key = PropertiesService.getScriptProperties().getProperty('GEMINI_API_KEY');
+  if (!key) return -1;
+  var sh = SpreadsheetApp.getActiveSheet();
+  var data = sh.getDataRange().getValues();
+  if (data.length < 2) return 0;
+  var header = data[0].map(function (h) { return String(h).trim(); });
+  var cKw = header.indexOf('keywords');
+  var cText = header.indexOf('text');
+  if (cKw < 0 || cText < 0) return -1;
+
+  var made = 0;
+  for (var r = 1; r < data.length; r++) {
+    var kw = String(data[r][cKw] || '').trim();
+    var text = String(data[r][cText] || '').trim();
+    if (kw && !text) {                       // キーワードあり・本文が空 の行だけ生成
+      var draft = callGemini(key, kw);
+      if (draft) { sh.getRange(r + 1, cText + 1).setValue(draft); made++; }
+      Utilities.sleep(1500);                 // 無料枠のレート対策
+    }
+  }
+  return made;
+}
+
+function callGemini(key, keywords) {
+  var url = 'https://generativelanguage.googleapis.com/v1beta/models/' + GEMINI_MODEL + ':generateContent?key=' + encodeURIComponent(key);
+  var prompt = STYLE +
+    '\n\nキーワード: ' + keywords +
+    '\n\n上記キーワードをもとに、Xに投稿する日本語の投稿文を1つだけ作ってください。' +
+    '文字数は改行を含め全角140〜150字を厳守(最低130字・最大155字、短すぎ厳禁)。' +
+    '読者の多くはスマホ利用者。2〜3個の短いかたまりに分け、意味の切れ目で改行(必要なら空行)を入れ、スマホで一目で読める見た目にする。' +
+    'ハッシュタグは付けても1個まで。URLは入れない。前置きや説明・かぎ括弧は付けず、投稿文そのものだけを出力。';
+  var payload = {
+    contents: [{ parts: [{ text: prompt }] }],
+    generationConfig: { temperature: 0.9, maxOutputTokens: 8000 } // 思考ぶんを見込んで大きめに(途中で切れないように)
+  };
+  var res = UrlFetchApp.fetch(url, {
+    method: 'post', contentType: 'application/json',
+    payload: JSON.stringify(payload), muteHttpExceptions: true
+  });
+  if (res.getResponseCode() !== 200) { Logger.log('HTTP ' + res.getResponseCode() + ': ' + res.getContentText()); return ''; }
+  try {
+    var j = JSON.parse(res.getContentText());
+    var cand = (j.candidates && j.candidates[0]) || {};
+    var parts = (cand.content && cand.content.parts) || [];
+    var out = '';
+    for (var i = 0; i < parts.length; i++) { if (parts[i] && parts[i].text) out += parts[i].text; }
+    out = out.trim();
+    if (!out) Logger.log('EMPTY finishReason=' + cand.finishReason + ' : ' + res.getContentText());
+    return out;
+  } catch (e) { Logger.log('PARSE ERR: ' + e + ' | ' + res.getContentText()); return ''; }
+}
+
+/* ===================== リマインドメール ===================== */
+function sendMorningReminder() { sendReminder('朝'); }
+function sendNoonReminder() { sendReminder('昼'); }
+function sendReminderTest() { sendReminder('テスト'); SpreadsheetApp.getUi().alert('テストメールを送信しました。'); }
+
+function sendReminder(label) {
+  try { generateDraftsCore(); } catch (e) { Logger.log(e); }  // まず空欄の下書きを自動生成
+  var ss = SpreadsheetApp.getActiveSpreadsheet();
+  var url = ss.getUrl();
+  var to = TO_EMAIL || Session.getEffectiveUser().getEmail();
+  if (!to) return;
+  var when = label === '朝' ? 'まもなく8:00に朝の投稿が走ります'
+           : label === '昼' ? 'まもなく12:45に昼の投稿が走ります'
+           : 'テスト送信です';
+  var subject = '【' + label + '】Xプロモの下書きチェック（投稿OKで確定）';
+  var body =
+    'おはようございます／おつかれさまです。\n\n' +
+    'Xプロモの下書きが用意できています。' + when + '。\n' +
+    '内容を確認して、出したい行の「投稿OK」にチェックを入れてください。\n' +
+    'チェックした行だけが投稿されます（未チェックは投稿されません）。\n\n' +
+    '▼ スプレッドシートを開く\n' + url + '\n\n' +
+    '※このメールは自動送信です。';
+  MailApp.sendEmail(to, subject, body);
+}
+
+// 朝7:15 / 昼12:00 の毎日トリガーをセット(重複を避けて作り直す)
+function setupReminders() {
+  var triggers = ScriptApp.getProjectTriggers();
+  for (var i = 0; i < triggers.length; i++) {
+    var fn = triggers[i].getHandlerFunction();
+    if (fn === 'sendMorningReminder' || fn === 'sendNoonReminder') ScriptApp.deleteTrigger(triggers[i]);
+  }
+  ScriptApp.newTrigger('sendMorningReminder').timeBased().atHour(7).nearMinute(15).everyDays(1).create();
+  ScriptApp.newTrigger('sendNoonReminder').timeBased().atHour(12).nearMinute(0).everyDays(1).create();
+  SpreadsheetApp.getUi().alert('朝7:15 / 昼12:00 のリマインドをセットしました（タイムゾーンが東京か確認してください）。');
+}

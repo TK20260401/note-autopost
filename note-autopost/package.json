@@ -1,0 +1,16 @@
+{
+  "name": "note-autopost",
+  "version": "1.0.0",
+  "type": "module",
+  "private": true,
+  "scripts": {
+    "start": "node src/index.js",
+    "init": "INIT=1 node src/index.js",
+    "promo": "node src/promo.js",
+    "promo:dry": "DRY_RUN=1 node src/promo.js"
+  },
+  "dependencies": {
+    "rss-parser": "^3.13.0",
+    "twitter-api-v2": "^1.18.2"
+  }
+}
